@@ -42,6 +42,7 @@ interface SearchMatch {
   isp: string;
   transport: string;
   cpe?: string[];
+  vulns?: string[];
   version?: string;
   hostnames: string[];
   domains: string[];
@@ -117,6 +118,7 @@ interface ShodanHostResponse {
   hostnames: string[];
   domains: string[];
   tags: string[];
+  vuln?: string[];
 }
 
 dotenv.config();
@@ -378,6 +380,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             "ASN": result.asn,
             "Last Update": result.last_update
           },
+          "Vulnerabilities": result.vulns && result.vulns.length > 0 
+            ? result.vulns 
+            : "No vulnerabilities found",
+        },
           "Location": {
             "Country": result.country_name,
             "City": result.city,
@@ -461,6 +467,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "Version": match.version || "Unknown",
               "CPE": match.cpe || []
             },
+            "Vulnerabilities": match.vulns && match.vulns.length > 0 
+              ? match.vulns 
+              : "None detected",
             "Web Information": match.http ? {
               "Server": match.http.server,
               "Title": match.http.title,
