@@ -51,6 +51,26 @@ interface SearchMatch {
   port: number;
   data: string;
   asn: string;
+  ssl?: {
+    cert?: {
+      subject?: {
+        CN?: string;
+        O?: string;
+      };
+      issuer?: {
+        CN?: string;
+        O?: string;
+      };
+      expired?: boolean;
+      fingerprint?: {
+        sha1?: string;
+      };
+    };
+    cipher?: {
+      name?: string;
+      version?: string;
+    };
+  };
   http?: {
     server?: string;
     title?: string;
@@ -264,6 +284,27 @@ function parseS7Banner(banner: string | undefined) {
         "Firmware Version": firmwareMatch ? firmwareMatch[1].trim() : "Unknown",
         "Serial Number": serialMatch ? serialMatch[1].trim() : "Unknown",
         "Plant ID": plantIdMatch ? plantIdMatch[1].trim() : "None"
+    };
+}
+
+function analyzeCertificate(ssl: any) {
+    if (!ssl || !ssl.cert) return null;
+
+    const subject = ssl.cert.subject || {};
+    const issuer = ssl.cert.issuer || {};
+    const isSelfSigned = subject.CN === issuer.CN && subject.O === issuer.O;
+    const isExpired = ssl.cert.expired;
+
+    let hygieneScore = "GOOD";
+    if (isExpired) hygieneScore = "POOR (Expired)";
+    if (isSelfSigned) hygieneScore = "RISKY (Self-Signed)";
+
+    return {
+        "Owner (Subject)": subject.O || subject.CN || "Unknown",
+        "Issuer": issuer.O || issuer.CN || "Unknown",
+        "Status": isExpired ? "⚠️ EXPIRED" : "Valid",
+        "Type": isSelfSigned ? "⚠️ Self-Signed (Internal Use?)" : "Public CA",
+        "Hygiene Check": hygieneScore
     };
 }
 
@@ -667,11 +708,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 "OT Details": {
                     "Product": match.product || "Unknown",
                     "Protocol": match.transport,
-                    // LOGIC: If port 102 -> Parse Siemens. If port 44818 -> Parse Rockwell.
+                    
+                    // EXISTING: Protocol Parsers
                     ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
                     ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNetIPBanner(match.data) } : {}),
+                    
+                    // NEW: Certificate Intelligence
+                    ...(match.ssl ? { "Digital Identity (SSL)": analyzeCertificate(match.ssl) } : {}),
 
-                    // Fallback for unparsed protocols
                     "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
                 }
             }))
