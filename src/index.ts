@@ -552,28 +552,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "ot_asset_search": {
-          const args = request.params.arguments as any; // (Use Zod parse in real code)
-   
-          // MAP: High-Level Intent -> Low-Level Shodan Query
+          // 1. Parse Arguments
+          const parsedArgs = z.object({
+            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "general_ics"]),
+            country: z.string().length(2).optional(),
+            org: z.string().optional(),
+          }).safeParse(args);
+
+          if (!parsedArgs.success) {
+            throw new Error("Invalid arguments for ot_asset_search");
+          }
+
+          // 2. Build Query
           const queryMap: Record<string, string> = {
-              "siemens_s7": 'port:102 "Original Siemens Equipment"', // High fidelity for S7-300/400/1200/1500
-              "modbus_generic": 'port:502', // Standard Modbus
-              "niagara_building": 'port:1911,4911 product:"Niagara"', // Tridium Niagara (Building Automation)
-              "bacnet_building": 'port:47808', // BACnet UDP
-              "ethernet_ip": 'port:44818', // Rockwell/Allen-Bradley
-              "omron_plc": 'port:9600 response:"OMRON"', // Omron FINS
-              "general_ics": 'tag:ics' // Broad sweep
+              "siemens_s7": 'port:102 "Original Siemens Equipment"',
+              "modbus_generic": 'port:502',
+              "niagara_building": 'port:1911,4911 product:"Niagara"',
+              "bacnet_building": 'port:47808',
+              "ethernet_ip": 'port:44818',
+              "omron_plc": 'port:9600 response:"OMRON"',
+              "general_ics": 'tag:ics'
           };
 
-          let finalQuery = queryMap[args.asset_type];
-          if (args.country) finalQuery += ` country:"${args.country}"`;
-          if (args.org) finalQuery += ` org:"${args.org}"`;
+          let finalQuery = queryMap[parsedArgs.data.asset_type];
+          if (parsedArgs.data.country) finalQuery += ` country:"${parsedArgs.data.country}"`;
+          if (parsedArgs.data.org) finalQuery += ` org:"${parsedArgs.data.org}"`;
 
-          // Re-use your existing queryShodan function
-          const result = await queryShodan("/shodan/host/search", {
+          // 3. Execute Query
+          const result: SearchResponse = await queryShodan("/shodan/host/search", {
               query: finalQuery,
-              limit: 10, // Keep limit low for safety
-          });        
+              limit: 10,
+          });
+
+          // 4. Format Output (The missing part!)
+          const formattedResult = {
+            "OT Hunt Summary": {
+                "Target": parsedArgs.data.asset_type,
+                "Query Used": finalQuery,
+                "Total Found": result.total
+            },
+            "Assets Found": result.matches.map(match => ({
+                "IP": match.ip_str,
+                "Organization": match.org,
+                "Location": `${match.location.city}, ${match.location.country_name}`,
+                "Risk Analysis": {
+                    "Honeypot Level": calculateHoneypotRisk(match),
+                    "Open Ports": match.port
+                },
+                "OT Details": {
+                    "Product": match.product || "Unknown",
+                    "Protocol": match.transport,
+                    // Try to parse S7 details if it's Siemens
+                    ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {})
+                }
+            }))
+          };
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(formattedResult, null, 2),
+              },
+            ],
+          };
+      } 
 
       case "cve_lookup": {
         const parsedCveArgs = CVELookupArgsSchema.safeParse(args);
