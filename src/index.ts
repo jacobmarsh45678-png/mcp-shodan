@@ -267,6 +267,26 @@ function parseS7Banner(banner: string | undefined) {
     };
 }
 
+function parseEtherNetIPBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // Rockwell/EtherNet-IP banners usually contain these fields
+    const productMatch = banner.match(/Product Name:\s*([^\n]+)/);
+    const vendorMatch = banner.match(/Vendor ID:\s*([^\n]+)/);
+    const serialMatch = banner.match(/Serial Number:\s*0x([0-9A-Fa-f]+)/);
+    const deviceTypeMatch = banner.match(/Device Type:\s*([^\n]+)/);
+
+    // If we don't find a product name, it's likely not a rich EtherNet/IP banner
+    if (!productMatch) return null;
+
+    return {
+        "Vendor": vendorMatch ? vendorMatch[1].trim() : "Unknown (Likely Rockwell)",
+        "Product": productMatch[1].trim(), // e.g., "1769-L30ER"
+        "Device Type": deviceTypeMatch ? deviceTypeMatch[1].trim() : "Unknown",
+        "Serial Hex": serialMatch ? serialMatch[1] : "Unknown"
+    };
+}
+
 function calculateHoneypotRisk(host: any): string {
     let riskScore = 0;
     const cloudProviders = ["Amazon", "DigitalOcean", "Google", "Microsoft", "Alibaba", "Tencent"];
@@ -602,8 +622,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 "OT Details": {
                     "Product": match.product || "Unknown",
                     "Protocol": match.transport,
-                    // Try to parse S7 details if it's Siemens
-                    ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {})
+                    // LOGIC: If port 102 -> Parse Siemens. If port 44818 -> Parse Rockwell.
+                    ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
+                    ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNe
+
+                    // Fallback for unparsed protocols
+                    "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
                 }
             }))
           };
