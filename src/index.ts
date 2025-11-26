@@ -624,7 +624,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     "Protocol": match.transport,
                     // LOGIC: If port 102 -> Parse Siemens. If port 44818 -> Parse Rockwell.
                     ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
-                    ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNe
+                    ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNetIPBanner(match.data) } : {}),
 
                     // Fallback for unparsed protocols
                     "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
