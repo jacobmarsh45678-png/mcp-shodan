@@ -651,8 +651,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             "Assets Found": result.matches.map(match => ({
                 "IP": match.ip_str,
                 "Organization": match.org,
-                "Location": `${match.location.city}, ${match.location.country_name}`,
-                "Risk Analysis": {
+                "Location": {
+                    "City": `${match.location.city}, ${match.location.country_name}`,
+                    "Coordinates": `${match.location.latitude}, ${match.location.longitude}`,
+                    // NEW: Clickable Map Link
+                    "Map View": `https://www.google.com/maps?q=${match.location.latitude},${match.location.longitude}`
+                },                "Risk Analysis": {
                     "Honeypot Level": calculateHoneypotRisk(match),
                     // NEW: Check if the asset has the "kev" tag
                     "Critical Threats": match.tags && match.tags.includes("kev") 
