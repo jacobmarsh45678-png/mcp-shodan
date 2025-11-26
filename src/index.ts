@@ -267,6 +267,30 @@ function parseS7Banner(banner: string | undefined) {
     };
 }
 
+function calculateHoneypotRisk(host: any): string {
+    let riskScore = 0;
+    const cloudProviders = ["Amazon", "DigitalOcean", "Google", "Microsoft", "Alibaba", "Tencent"];
+   
+    // CHECK 1: Is the "PLC" hosted in a cloud data center? (Real PLCs are usually on ISPs/Mobile/Biz lines)
+    if (cloudProviders.some(provider => host.org?.includes(provider) || host.isp?.includes(provider))) {
+        riskScore += 50;
+    }
+
+    // CHECK 2: Does it have too many ports open? (Real PLCs usually have 1-3 ports, e.g., 80 + 102)
+    if (host.ports && host.ports.length > 5) {
+        riskScore += 30;
+    }
+
+    // CHECK 3: Tag check
+    if (host.tags && host.tags.includes("honeypot")) {
+        riskScore += 100;
+    }
+
+    if (riskScore >= 50) return "HIGH (Likely Honeypot)";
+    if (riskScore >= 30) return "MEDIUM (Suspicious)";
+    return "LOW (Likely Real Asset)";
+    }
+
 // Helper Function for CVEs by product/CPE lookups using CVEDB
 async function queryCVEsByProduct(params: {
   cpe23?: string;
@@ -549,31 +573,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const result = await queryShodan("/shodan/host/search", {
               query: finalQuery,
               limit: 10, // Keep limit low for safety
-          });
-
-          function calculateHoneypotRisk(host: any): string {
-              let riskScore = 0;
-              const cloudProviders = ["Amazon", "DigitalOcean", "Google", "Microsoft", "Alibaba", "Tencent"];
-   
-              // CHECK 1: Is the "PLC" hosted in a cloud data center? (Real PLCs are usually on ISPs/Mobile/Biz lines)
-              if (cloudProviders.some(provider => host.org?.includes(provider) || host.isp?.includes(provider))) {
-                  riskScore += 50;
-              }
-
-              // CHECK 2: Does it have too many ports open? (Real PLCs usually have 1-3 ports, e.g., 80 + 102)
-              if (host.ports && host.ports.length > 5) {
-                  riskScore += 30;
-              }
-
-              // CHECK 3: Tag check
-              if (host.tags && host.tags.includes("honeypot")) {
-                  riskScore += 100;
-              }
-
-              if (riskScore >= 50) return "HIGH (Likely Honeypot)";
-              if (riskScore >= 30) return "MEDIUM (Suspicious)";
-              return "LOW (Likely Real Asset)";
-          }        
+          });        
 
       case "cve_lookup": {
         const parsedCveArgs = CVELookupArgsSchema.safeParse(args);
