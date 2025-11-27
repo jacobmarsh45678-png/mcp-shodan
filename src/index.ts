@@ -46,6 +46,10 @@ interface SearchMatch {
   version?: string;
   hostnames: string[];
   domains: string[];
+  rfb?: {
+    authentication?: string; // "disabled" or "vnc"
+    version?: string;
+  };
   location: SearchLocation;
   timestamp: string;
   port: number;
@@ -89,6 +93,7 @@ interface SearchMatch {
   http?: {
     server?: string;
     title?: string;
+    components?: Record<string, any>;
     robots?: string | null;
     sitemap?: string | null;
   };
@@ -379,6 +384,48 @@ function guessCPE(product: string | undefined) {
     return null;
 }
 
+function extractEngineeringArtifacts(data: string | undefined) {
+    if (!data) return null;
+
+    // Regex for Critical ICS Project Files
+    const artifactRegex = /[\w-]+\.(acd|ap[1-9][0-9]|pro|opt|v1[0-9]|pwx|scd|cid|mer|apa)/gi;
+    
+    const artifacts = data.match(artifactRegex);
+    
+    if (!artifacts) return null;
+
+    // Deduplicate found files
+    const uniqueArtifacts = [...new Set(artifacts)];
+
+    return {
+        "Artifacts Found": uniqueArtifacts,
+        "Significance": "🚨 CRITICAL: Engineering/Project Files Detected. Source Code Leakage.",
+        "File Types": uniqueArtifacts.map(f => f.split('.').pop()?.toUpperCase()).join(", ")
+    };
+}
+
+function classifyInfrastructure(isp: string | undefined, org: string | undefined) {
+    const s = (isp + " " + org).toLowerCase();
+    
+    // 1. Check for Cellular/Mobile (Remote Stations)
+    if (s.match(/(wireless|mobility|cellular|4g|5g|lte|vodafone|t-mobile|verizon wireless|att mobility)/)) {
+        return "📡 CELLULAR / REMOTE STATION (High Likelihood of Unmanned Site)";
+    }
+
+    // 2. Check for Residential (Shadow OT)
+    if (s.match(/(cable|dsl|fios|residential|consumer|home|broadband|telekom|sky)/)) {
+        return "🏠 RESIDENTIAL / SHADOW OT (Likely Engineer's Home)";
+    }
+
+    // 3. Check for Cloud/Hosting (Honeypot Risk)
+    if (s.match(/(amazon|azure|digitalocean|google cloud|alibaba|tencent|oracle|hosting|vps)/)) {
+        return "☁️ CLOUD HOSTING (High Risk of Honeypot)";
+    }
+
+    // 4. Default
+    return "🏢 Enterprise / Business ISP";
+}
+
 function parseDNP3Banner(banner: string | undefined) {
     if (!banner) return null;
 
@@ -397,6 +444,47 @@ function parseDNP3Banner(banner: string | undefined) {
         "Source Address": sourceMatch ? sourceMatch[1] : "Unknown",
         "Destination Address": destMatch ? destMatch[1] : "Unknown",
         "Protocol Warning": "Cleartext SCADA Protocol (No Auth)"
+    };
+}
+
+function parseVNCDetails(rfb: any) {
+    if (!rfb) return null;
+
+    const isAuthDisabled = rfb.authentication === "disabled";
+    
+    return {
+        "Protocol Version": rfb.version || "Unknown",
+        "Authentication Status": isAuthDisabled 
+            ? "🚨 DISABLED (Unrestricted Access)" 
+            : "Enabled",
+        "Risk Assessment": isAuthDisabled 
+            ? "CRITICAL - Direct Visual Control Possible" 
+            : "Medium (Brute-force target)"
+    };
+}
+
+function analyzeWebStack(http: any) {
+    if (!http) return null;
+
+    const server = http.server || "Unknown";
+    const title = http.title || "No Title";
+    
+    // Tactical Web Intelligence
+    const dangerousServers: Record<string, string> = {
+        "RomPager": "⚠️ Vulnerable to 'Misfortune Cookie' (CVE-2014-9222)",
+        "GoAhead-Webs": "⚠️ Common IoT Target (Check CVE-2017-17562)",
+        "Boa": "⚠️ Discontinued/Legacy (High Risk)",
+        "MicroHttpd": "⚠️ Minimal IoT Server (Often Fuzzable)"
+    };
+
+    // Check if the server string matches any known bad targets
+    const threatIntel = Object.entries(dangerousServers).find(([k, v]) => server.includes(k));
+
+    return {
+        "Server Software": server,
+        "Page Title": title,
+        "Vulnerability Hint": threatIntel ? threatIntel[1] : "Standard Web Stack",
+        "Components": http.components ? Object.keys(http.components).join(", ") : "None detected"
     };
 }
 
@@ -653,7 +741,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       name: "ot_asset_search",
       description: "Specialized search for Industrial Control Systems (OT). Maps high-level device types to specific, high-fidelity Shodan queries (ports, tags, and product names). Use this for finding PLCs, HMIs, or specific protocols.",
       inputSchema: zodToJsonSchema(z.object({
-        asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "general_ics"])
+        asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "general_ics"])
           .describe("The specific class of OT device to hunt for."),
         country: z.string().length(2).optional().describe("2-letter country code (e.g., 'DE', 'US')."),
         org: z.string().optional().describe("Filter by specific organization name."),
@@ -835,7 +923,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ot_asset_search": {
           // 1. Parse Arguments
           const parsedArgs = z.object({
-            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "general_ics"]),
+            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "general_ics"]),
             country: z.string().length(2).optional(),
             org: z.string().optional(),
           }).safeParse(args);
@@ -855,6 +943,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "omron_plc": 'port:9600 response:"OMRON"',
               "mqtt_iiot": 'port:1883',
               "coap_smartgrid": 'port:5683',
+              "vnc_hmi": 'port:5900',
               "general_ics": 'tag:ics'
           };
 
@@ -890,6 +979,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         // FIXED: Correct Google Maps Link
                         "Map View": `https://www.google.com/maps?q=$${match.location.latitude},${match.location.longitude}`
                     },
+                    "Infrastructure Type": classifyInfrastructure(match.isp, match.org),
                     "Risk Analysis": {
                         "Honeypot Level": calculateHoneypotRisk(match),
                         "Critical Threats": match.tags && match.tags.includes("kev") 
@@ -916,18 +1006,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         "Product": match.product || "Unknown",
                         "Protocol": match.transport,
                         
-                        // EXISTING: Protocol Parsers
+                        // --- EXISTING PROTOCOL PARSERS ---
                         ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
                         ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNetIPBanner(match.data) } : {}),
                         ...(match.port === 502 ? { "Modbus Internals": parseModbusBanner(match.data) } : {}),
                         ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}),
                         ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
+                    
+                        // --- EXISTING HMI/IoT PARSERS ---
                         ...(match.port === 1883 ? { "MQTT Broker (IIoT)": parseMQTTDetails(match.mqtt) } : {}),
                         ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
-                        // leak hunter
+                        ...(match.port === 5900 ? { "VNC / HMI Panel": parseVNCDetails(match.rfb) } : {}),
+                        ...(match.http ? { "Web Interface Intel": analyzeWebStack(match.http) } : {}),
+
+                        // --- NEW: ARTIFACT HUNTER ---
+                        // Scans raw banners for .ACD, .AP14, etc.
+                        ...(extractEngineeringArtifacts(match.data) ? { "Engineering Artifacts": extractEngineeringArtifacts(match.data) } : {}),
+                    
+                        // --- EXISTING: LEAK HUNTER ---
                         ...(extractLeaks(match.data) ? { "Information Leakage": extractLeaks(match.data) } : {}),
-                        
-                        // EXISTING: Certificate Intelligence
+
+                        // --- EXISTING: SSL ---
                         ...(match.ssl ? { "Digital Identity (SSL)": analyzeCertificate(match.ssl) } : {}),
 
                         "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
