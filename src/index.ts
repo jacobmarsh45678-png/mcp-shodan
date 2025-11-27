@@ -49,6 +49,12 @@ interface SearchMatch {
   location: SearchLocation;
   timestamp: string;
   port: number;
+  mqtt?: {
+    topics?: Record<string, string>; // Shodan returns topic: payload pairs
+  };
+  coap?: {
+    resources?: Record<string, string>; // resource_path: title
+  };
   data: string;
   asn: string;
   bacnet?: {
@@ -160,6 +166,16 @@ if (!SHODAN_API_KEY) {
 
 const API_BASE_URL = "https://api.shodan.io";
 const CVEDB_API_URL = "https://cvedb.shodan.io";
+const DEFAULT_CREDS_DB: Record<string, string[]> = {
+    "Moxa": ["admin:moxa", "admin:(blank)"],
+    "Tridium": ["tridium:niagara", "admin:(blank)", "sysmik:intesa"],
+    "Rockwell": ["Administrator:(blank)", "admin:password"],
+    "Siemens": ["admin:(blank)", "Everybody:(no password)"],
+    "Schneider": ["admin:admin", "Administrator:Administrator"],
+    "WAGO": ["admin:wago", "user:user"],
+    "Hirschmann": ["admin:private"],
+    "Niagara": ["station:station", "admin:admin"]
+};
 
 // Logging Helper Function
 function logToFile(message: string) {
@@ -277,6 +293,36 @@ async function queryCPEDB(params: {
   }
 }
 
+function extractLeaks(data: string | undefined) {
+    if (!data) return null;
+
+    // Regex for Private IPs (10.x, 192.168.x, 172.16-31.x)
+    const privateIpRegex = /(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))(?:\.\d{1,3}){2}/g;
+    
+    // Regex for Windows Paths (e.g. C:\Project)
+    const winPathRegex = /[C-Z]:\\[\w\s\-\\]+/gi;
+    
+    // Regex for Emails
+    const emailRegex = /[\w\.-]+@[\w\.-]+\.\w{2,}/g;
+
+    const ips = data.match(privateIpRegex) || [];
+    const paths = data.match(winPathRegex) || [];
+    const emails = data.match(emailRegex) || [];
+
+    // Filter duplicates
+    const uniqueIPs = [...new Set(ips)];
+    const uniquePaths = [...new Set(paths)];
+    const uniqueEmails = [...new Set(emails)];
+
+    if (uniqueIPs.length === 0 && uniquePaths.length === 0 && uniqueEmails.length === 0) return null;
+
+    return {
+        "Internal IP Leaks": uniqueIPs.length > 0 ? uniqueIPs : "None",
+        "System Paths": uniquePaths.length > 0 ? uniquePaths : "None",
+        "Leaked Emails": uniqueEmails.length > 0 ? uniqueEmails : "None"
+    };
+}
+
 function parseS7Banner(banner: string | undefined) {
     if (!banner) return null;
    
@@ -296,7 +342,43 @@ function parseS7Banner(banner: string | undefined) {
     };
 }
 
-// Add this to your helper functions
+function identifyDefaultCreds(product: string | undefined, org: string | undefined) {
+    if (!product && !org) return null;
+    const targets = [];
+    for (const [vendor, creds] of Object.entries(DEFAULT_CREDS_DB)) {
+        if (product?.toLowerCase().includes(vendor.toLowerCase()) || 
+            org?.toLowerCase().includes(vendor.toLowerCase())) {
+            targets.push(...creds);
+        }
+    }
+    return targets.length > 0 ? targets : null;
+}
+
+function generateExploitLinks(cves: string[] | undefined) {
+    if (!cves || cves.length === 0) return null;
+    return cves.slice(0, 3).map(cve => ({
+        "CVE": cve,
+        "ExploitDB": `https://www.exploit-db.com/search?cve=${cve.replace("CVE-", "")}`,
+        "PacketStorm": `https://packetstormsecurity.com/search/?q=${cve}`
+    }));
+}
+
+// THE HEURISTIC BRIDGE (Option 2)
+function guessCPE(product: string | undefined) {
+    if (!product) return null;
+    const p = product.toLowerCase();
+
+    // Heuristics for common OT gear that Shodan often misses
+    if (p.includes("s7-1200")) return "cpe:2.3:h:siemens:s7_1200:-:*:*:*:*:*:*:*";
+    if (p.includes("s7-1500")) return "cpe:2.3:h:siemens:s7_1500:-:*:*:*:*:*:*:*";
+    if (p.includes("s7-300")) return "cpe:2.3:h:siemens:s7_300:-:*:*:*:*:*:*:*";
+    if (p.includes("niagara")) return "cpe:2.3:a:tridium:niagara:-:*:*:*:*:*:*:*";
+    if (p.includes("micrologix")) return "cpe:2.3:h:rockwellautomation:micrologix:-:*:*:*:*:*:*:*";
+    if (p.includes("controllogix")) return "cpe:2.3:h:rockwellautomation:controllogix:-:*:*:*:*:*:*:*";
+    
+    return null;
+}
+
 function parseDNP3Banner(banner: string | undefined) {
     if (!banner) return null;
 
@@ -386,6 +468,36 @@ function parseEtherNetIPBanner(banner: string | undefined) {
         "Product": productMatch[1].trim(), // e.g., "1769-L30ER"
         "Device Type": deviceTypeMatch ? deviceTypeMatch[1].trim() : "Unknown",
         "Serial Hex": serialMatch ? serialMatch[1] : "Unknown"
+    };
+}
+
+function parseMQTTDetails(mqtt: any) {
+    if (!mqtt || !mqtt.topics) return null;
+
+    const topics = Object.keys(mqtt.topics);
+    // Topics often look like path/to/device/variable
+    // We analyze the path depth to guess the complexity of the facility
+    const pathDepth = topics.map(t => t.split('/').length).reduce((a, b) => a + b, 0) / topics.length;
+
+    return {
+        "Topic Count": topics.length,
+        "Structure Leaks": topics.slice(0, 5), // Show top 5 topics for context
+        "Complexity Score": pathDepth > 3 ? "HIGH (Deep Hierarchy Leaked)" : "Low",
+        "Raw Topics": topics.length > 5 ? `${topics.length - 5} more...` : "All listed"
+    };
+}
+
+function parseCoAPDetails(coap: any) {
+    if (!coap || !coap.resources) return null;
+    
+    const resources = Object.keys(coap.resources);
+    
+    return {
+        "Resource Count": resources.length,
+        "Endpoints": resources.slice(0, 5),
+        "Device Hint": resources.some(r => r.includes("meter") || r.includes("grid")) 
+            ? "Likely Smart Meter/Grid" 
+            : "Generic IoT"
     };
 }
 
@@ -738,10 +850,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "modbus_generic": 'port:502',
               "niagara_building": 'port:1911,4911 product:"Niagara"',
               "bacnet_building": 'port:47808',
-              // Inside the switch/map in ot_asset_search
               "dnp3_energy": 'port:20000 source address',
               "ethernet_ip": 'port:44818',
               "omron_plc": 'port:9600 response:"OMRON"',
+              "mqtt_iiot": 'port:1883',
+              "coap_smartgrid": 'port:5683',
               "general_ics": 'tag:ics'
           };
 
@@ -762,22 +875,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 "Query Used": finalQuery,
                 "Total Found": result.total
             },
-            "Assets Found": result.matches.map(match => ({
-                "IP": match.ip_str,
-                "Organization": match.org,
-                "Location": {
-                    "City": `${match.location.city}, ${match.location.country_name}`,
-                    "Coordinates": `${match.location.latitude}, ${match.location.longitude}`,
-                    // NEW: Clickable Map Link
-                    "Map View": `https://www.google.com/maps?q=${match.location.latitude},${match.location.longitude}`
-                },                "Risk Analysis": {
-                    "Honeypot Level": calculateHoneypotRisk(match),
-                    // NEW: Check if the asset has the "kev" tag
-                    "Critical Threats": match.tags && match.tags.includes("kev") 
-                        ? "⚠️ CONTAINS KNOWN EXPLOITED VULNERABILITIES" 
-                        : "No active exploitation tags",
-                    "Open Ports": match.port
-                },
+            "Assets Found": result.matches.map(match => {
+                // Run Heuristics
+                const guessedCPE = guessCPE(match.product);
+                const defaultCreds = identifyDefaultCreds(match.product, match.org);
+                const exploits = generateExploitLinks(match.vulns);
+
+                return {
+                    "IP": match.ip_str,
+                    "Organization": match.org,
+                    "Location": {
+                        "City": `${match.location.city}, ${match.location.country_name}`,
+                        "Coordinates": `${match.location.latitude}, ${match.location.longitude}`,
+                        // FIXED: Correct Google Maps Link
+                        "Map View": `https://www.google.com/maps?q=$${match.location.latitude},${match.location.longitude}`
+                    },
+                    "Risk Analysis": {
+                        "Honeypot Level": calculateHoneypotRisk(match),
+                        "Critical Threats": match.tags && match.tags.includes("kev") 
+                            ? "⚠️ CONTAINS KNOWN EXPLOITED VULNERABILITIES" 
+                            : "No active exploitation tags",
+                        "Open Ports": match.port
+                    },
+                    "Tactical Intelligence": {
+                        // OPTION 1: Default Creds
+                        "Potential Defaults": defaultCreds 
+                            ? `⚠️ TRY: ${defaultCreds.join(" | ")}` 
+                            : "None identified",
+                        
+                        // OPTION 2: Automated Vulnerability Mapping
+                        "Vulnerability Status": match.vulns ? `${match.vulns.length} CVEs identified` : "None listed",
+                        "Automated Research": match.cpe && match.cpe.length > 0
+                            ? `Use tool 'cves_by_product' with cpe23: '${match.cpe[0]}'`
+                            : (guessedCPE 
+                                ? `⚠️ Shodan missed the CPE. My heuristic suggests: '${guessedCPE}'`
+                                : "No CPE match found"),
+                        "Exploit Resources": exploits || "No CVEs mapped"
+                    },
+                    "OT Details": {
+                        "Product": match.product || "Unknown",
+                        "Protocol": match.transport,
+                        
+                        // EXISTING: Protocol Parsers
+                        ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
+                        ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNetIPBanner(match.data) } : {}),
+                        ...(match.port === 502 ? { "Modbus Internals": parseModbusBanner(match.data) } : {}),
+                        ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}),
+                        ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
+                        ...(match.port === 1883 ? { "MQTT Broker (IIoT)": parseMQTTDetails(match.mqtt) } : {}),
+                        ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
+                        // leak hunter
+                        ...(extractLeaks(match.data) ? { "Information Leakage": extractLeaks(match.data) } : {}),
+                        
+                        // EXISTING: Certificate Intelligence
+                        ...(match.ssl ? { "Digital Identity (SSL)": analyzeCertificate(match.ssl) } : {}),
+
+                        "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
+                    }
+                };
+            })
                 "Vulnerability Context": {
                     "Direct Match": match.vulns || [],
                     // Intelligence: If we have a product and version, suggest the exact CPE lookup
