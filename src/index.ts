@@ -800,7 +800,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     ...(match.port === 502 ? { "Modbus Internals": parseModbusBanner(match.data) } : {}),
                     // BACnet (Port 47808) - Note: we use match.bacnet object here, not match.data
                     ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
-                    
+                    // DNP3
+                    ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}),
+                  
                     // NEW: Certificate Intelligence
                     ...(match.ssl ? { "Digital Identity (SSL)": analyzeCertificate(match.ssl) } : {}),
 
