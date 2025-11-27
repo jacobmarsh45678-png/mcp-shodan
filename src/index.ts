@@ -369,6 +369,37 @@ function parseS7Banner(banner: string | undefined) {
     };
 }
 
+function parseOmronBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // Omron FINS often leaks the exact Controller Model
+    const modelMatch = banner.match(/(CJ1[G-M]|CP1[L-H]|CS1[D-G-H]|NJ[0-9]+|NX[0-9]+)/);
+    const versionMatch = banner.match(/kV([\d\.]+)/); // Kernel Version
+
+    if (!modelMatch) return null;
+
+    return {
+        "Controller Model": modelMatch[0],
+        "Kernel Version": versionMatch ? versionMatch[1] : "Unknown",
+        "Protocol": "Omron FINS (Factory Automation)"
+    };
+}
+
+function parseRedLionBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // Red Lion / Crimson V3 devices
+    if (banner.includes("Crimson") || banner.includes("Red Lion")) {
+        const dbMatch = banner.match(/Database:\s*([^\r\n]+)/);
+        return {
+            "Vendor": "Red Lion Controls",
+            "Platform": "Crimson HMI/Gateway",
+            "Internal Database Name": dbMatch ? dbMatch[1] : "Unknown (Project File Name)"
+        };
+    }
+    return null;
+}
+
 function decodeHex(data: string | undefined) {
     if (!data) return null;
 
@@ -665,19 +696,51 @@ function analyzeWebStack(http: any) {
 function parseModbusBanner(banner: string | undefined) {
     if (!banner) return null;
 
-    // Modbus banners in Shodan data often look like: "Unit ID: 1\nSlave ID Data: ..."
+    // 1. Basic Data (The old way)
     const unitIdMatch = banner.match(/Unit ID:\s*(\d+)/);
     const slaveIdMatch = banner.match(/Slave ID Data:\s*([^\n]+)/);
-    const funcCodeMatch = banner.match(/Function Code:\s*(\d+)/);
-    const exceptionMatch = banner.match(/Exception Code:\s*(\d+)/);
+    
+    // 2. DEEP EXTRACTION: Modbus MEI (Function 43) / Identity Strings
+    // Shodan banners often contain: "VendorName: Schneider Electric"
+    const vendorMatch = banner.match(/VendorName:\s*([^\r\n]+)/);
+    const productMatch = banner.match(/ProductCode:\s*([^\r\n]+)/);
+    const revisionMatch = banner.match(/MajorMinorRevision:\s*([^\r\n]+)/);
 
-    if (!unitIdMatch && !slaveIdMatch) return null;
+    // If we have ZERO data, return null
+    if (!unitIdMatch && !slaveIdMatch && !vendorMatch) return null;
 
     return {
         "Unit ID": unitIdMatch ? unitIdMatch[1] : "Unknown",
-        "Slave Data": slaveIdMatch ? slaveIdMatch[1].trim() : "None",
-        "Response Type": exceptionMatch ? `⚠️ Exception Error (${exceptionMatch[1]})` : "Normal Response"
+        // Prefer the MEI data (High Fidelity) over the Slave ID (Low Fidelity)
+        "Vendor Identity": vendorMatch ? vendorMatch[1].trim() : "Unknown",
+        "Product Model": productMatch ? productMatch[1].trim() : "Unknown",
+        "Firmware Revision": revisionMatch ? revisionMatch[1].trim() : "Unknown",
+        "Raw Slave Data": slaveIdMatch ? slaveIdMatch[1].trim() : "None"
     };
+}
+
+function parseEtherNetIPBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // EtherNet/IP Identity Object (Class 0x01)
+    const productMatch = banner.match(/Product Name:\s*([^\n]+)/);
+    const vendorMatch = banner.match(/Vendor ID:\s*([^\n]+)/);
+    const serialMatch = banner.match(/Serial Number:\s*0x([0-9A-Fa-f]+)/);
+    const typeMatch = banner.match(/Device Type:\s*([^\n]+)/);
+    
+    // Deep Revision Check
+    const revMatch = banner.match(/Revision:\s*(\d+\.\d+)/);
+
+    if (!productMatch && !vendorMatch) return null;
+
+    return {
+        "Product Name": productMatch ? productMatch[1].trim() : "Unknown",
+        "Vendor": vendorMatch ? vendorMatch[1].trim() : "Unknown",
+        "Device Type": typeMatch ? typeMatch[1].trim() : "Unknown",
+        "Serial Number": serialMatch ? serialMatch[1] : "Unknown",
+        "Firmware Revision": revMatch ? revMatch[1] : "Unknown"
+    };
+}
 }
 
 function parseBACnetDetails(bacnet: any) {
@@ -710,26 +773,6 @@ function analyzeCertificate(ssl: any) {
         "Status": isExpired ? "⚠️ EXPIRED" : "Valid",
         "Type": isSelfSigned ? "⚠️ Self-Signed (Internal Use?)" : "Public CA",
         "Hygiene Check": hygieneScore
-    };
-}
-
-function parseEtherNetIPBanner(banner: string | undefined) {
-    if (!banner) return null;
-
-    // Rockwell/EtherNet-IP banners usually contain these fields
-    const productMatch = banner.match(/Product Name:\s*([^\n]+)/);
-    const vendorMatch = banner.match(/Vendor ID:\s*([^\n]+)/);
-    const serialMatch = banner.match(/Serial Number:\s*0x([0-9A-Fa-f]+)/);
-    const deviceTypeMatch = banner.match(/Device Type:\s*([^\n]+)/);
-
-    // If we don't find a product name, it's likely not a rich EtherNet/IP banner
-    if (!productMatch) return null;
-
-    return {
-        "Vendor": vendorMatch ? vendorMatch[1].trim() : "Unknown (Likely Rockwell)",
-        "Product": productMatch[1].trim(), // e.g., "1769-L30ER"
-        "Device Type": deviceTypeMatch ? deviceTypeMatch[1].trim() : "Unknown",
-        "Serial Hex": serialMatch ? serialMatch[1] : "Unknown"
     };
 }
 
@@ -796,6 +839,29 @@ function parseMQTTDetails(mqtt: any) {
         "Complexity Score": pathDepth > 3 ? "HIGH (Deep Hierarchy Leaked)" : "Low",
         "Raw Topics": topics.length > 5 ? `${topics.length - 5} more...` : "All listed"
     };
+}
+
+function detectGatewayRole(ports: number[]) {
+    const roles = [];
+
+    // Check for Multi-Protocol support (A sign of a Bridge/Converter)
+    const hasS7 = ports.includes(102);
+    const hasEnIP = ports.includes(44818);
+    const hasModbus = ports.includes(502);
+    const hasDNP3 = ports.includes(20000);
+    const hasBACnet = ports.includes(47808);
+
+    // Count how many OT protocols are active
+    const protocolCount = [hasS7, hasEnIP, hasModbus, hasDNP3, hasBACnet].filter(Boolean).length;
+
+    if (protocolCount >= 2) {
+        roles.push(`🌐 MULTI-PROTOCOL GATEWAY (Speaks ${protocolCount} languages)`);
+    }
+
+    if (hasS7 && hasEnIP) roles.push("🔄 Siemens-Rockwell Bridge (Critical Junction)");
+    if (hasModbus && hasBACnet) roles.push("🏢 Industrial-to-Building Bridge");
+    
+    return roles.length > 0 ? roles : "Single-Purpose Device";
 }
 
 function analyzeGatewayTopology(match: any) {
@@ -1236,6 +1302,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "coap_smartgrid": 'port:5683',
               "vnc_hmi": 'port:5900',
               "snmp_infrastructure": 'port:161',
+              "omron_plc": 'port:9600 response:"OMRON"', 
+              "redlion_gateway": 'port:789', 
               "general_ics": 'tag:ics'
           };
 
@@ -1297,6 +1365,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     "Software Supply Chain": match.http ? extractSBOM(match.http) : "No Web Components",
                     "Operational Context": predictOperationalRole(match) || "Insufficient Data to Predict Role",
                     "Hardware Profile": analyzeHardwareProfile(match.product, match.data),
+                    "Internal Topology": analyzeGatewayTopology(match), 
+                    "Device Role": detectGatewayRole(result.matches[0].ports || [match.port]), 
                     "OT Details": {
                         "Product": match.product || "Unknown",
                         "Protocol": match.transport,
@@ -1307,7 +1377,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         ...(match.port === 502 ? { "Modbus Internals": parseModbusBanner(match.data) } : {}),
                         ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}), // <--- Wired DNP3
                         ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
-                    
+                        ...(match.port === 9600 ? { "Omron Internals": parseOmronBanner(match.data) } : {}),
+                        ...(match.port === 789 ? { "Red Lion Details": parseRedLionBanner(match.data) } : {}),
+                        
                         // --- HMI / IoT PARSERS ---
                         ...(match.port === 1883 ? { "MQTT Broker (IIoT)": parseMQTTDetails(match.mqtt) } : {}),
                         ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
