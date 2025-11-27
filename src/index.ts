@@ -978,7 +978,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ot_asset_search": {
           // 1. Parse Arguments
           const parsedArgs = z.object({
-            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "general_ics"]),
+            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "dnp3_energy", "general_ics"]),
             country: z.string().length(2).optional(),
             org: z.string().optional(),
           }).safeParse(args);
@@ -1012,7 +1012,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               limit: 10,
           });
 
-          // 4. Format Output (The missing part!)
+          // 4. Format Output
           const formattedResult = {
             "OT Hunt Summary": {
                 "Target": parsedArgs.data.asset_type,
@@ -1020,18 +1020,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 "Total Found": result.total
             },
             "Assets Found": result.matches.map(match => {
-                // Run Heuristics
+                // Run Heuristics & Helpers
                 const guessedCPE = guessCPE(match.product);
                 const defaultCreds = identifyDefaultCreds(match.product, match.org);
                 const exploits = generateExploitLinks(match.vulns);
+                const infraType = classifyInfrastructure(match.isp, match.org);
+                const pivots = generatePivots(match);
+                const sbom = match.http ? extractSBOM(match.http) : "No Web Components";
 
                 return {
                     "IP": match.ip_str,
                     "Organization": match.org,
+                    "Infrastructure Type": infraType, // <--- Added this
                     "Location": {
                         "City": `${match.location.city}, ${match.location.country_name}`,
                         "Coordinates": `${match.location.latitude}, ${match.location.longitude}`,
-                        // FIXED: Correct Google Maps Link
                         "Map View": `https://www.google.com/maps?q=$${match.location.latitude},${match.location.longitude}`
                     },
                     "Risk Analysis": {
@@ -1042,12 +1045,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         "Open Ports": match.port
                     },
                     "Tactical Intelligence": {
-                        // OPTION 1: Default Creds
                         "Potential Defaults": defaultCreds 
                             ? `⚠️ TRY: ${defaultCreds.join(" | ")}` 
                             : "None identified",
-                        
-                        // OPTION 2: Automated Vulnerability Mapping
                         "Vulnerability Status": match.vulns ? `${match.vulns.length} CVEs identified` : "None listed",
                         "Automated Research": match.cpe && match.cpe.length > 0
                             ? `Use tool 'cves_by_product' with cpe23: '${match.cpe[0]}'`
@@ -1056,40 +1056,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                                 : "No CPE match found"),
                         "Exploit Resources": exploits || "No CVEs mapped"
                     },
-                    "Infrastructure Type": classifyInfrastructure(match.isp, match.org),
-                    "Pivot Points (Lateral Movement)": generatePivots(match),
-                    "Software Supply Chain": match.http ? extractSBOM(match.http) : "No Web Components",
+                    "Pivot Points": pivots, // <--- Added this
+                    "Software Supply Chain": sbom, // <--- Added this
                     "OT Details": {
                         "Product": match.product || "Unknown",
                         "Protocol": match.transport,
                         
-                        // --- EXISTING PROTOCOL PARSERS ---
+                        // --- PROTOCOL PARSERS ---
                         ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
                         ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNetIPBanner(match.data) } : {}),
                         ...(match.port === 502 ? { "Modbus Internals": parseModbusBanner(match.data) } : {}),
-                        ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}),
+                        ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}), // <--- Wired DNP3
                         ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
                     
-                        // --- EXISTING HMI/IoT PARSERS ---
+                        // --- HMI / IoT PARSERS ---
                         ...(match.port === 1883 ? { "MQTT Broker (IIoT)": parseMQTTDetails(match.mqtt) } : {}),
                         ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
                         ...(match.port === 5900 ? { "VNC / HMI Panel": parseVNCDetails(match.rfb) } : {}),
+                        
+                        // --- WEB FORENSICS ---
                         ...(match.http ? { "Web Interface Intel": analyzeWebStack(match.http) } : {}),
 
-                        // --- NEW: ARTIFACT HUNTER ---
-                        // Scans raw banners for .ACD, .AP14, etc.
+                        // --- ARTIFACTS & LEAKS ---
                         ...(extractEngineeringArtifacts(match.data) ? { "Engineering Artifacts": extractEngineeringArtifacts(match.data) } : {}),
-                    
-                        // --- EXISTING: LEAK HUNTER ---
                         ...(extractLeaks(match.data) ? { "Information Leakage": extractLeaks(match.data) } : {}),
 
-                        // --- EXISTING: SSL ---
+                        // --- IDENTITY ---
                         ...(match.ssl ? { "Digital Identity (SSL)": analyzeCertificate(match.ssl) } : {}),
 
                         "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
                     }
                 };
             })
+          };
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(formattedResult, null, 2),
+              },
+            ],
+          };
+      }
+        
                 "Vulnerability Context": {
                     "Direct Match": match.vulns || [],
                     // Intelligence: If we have a product and version, suggest the exact CPE lookup
