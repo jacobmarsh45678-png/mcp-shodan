@@ -1031,7 +1031,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return {
                     "IP": match.ip_str,
                     "Organization": match.org,
-                    "Infrastructure Type": infraType, // <--- Added this
                     "Location": {
                         "City": `${match.location.city}, ${match.location.country_name}`,
                         "Coordinates": `${match.location.latitude}, ${match.location.longitude}`,
@@ -1056,8 +1055,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                                 : "No CPE match found"),
                         "Exploit Resources": exploits || "No CVEs mapped"
                     },
-                    "Pivot Points": pivots, // <--- Added this
-                    "Software Supply Chain": sbom, // <--- Added this
+                    "Infrastructure Type": classifyInfrastructure(match.isp, match.org),
+                    "Pivot Points (Lateral Movement)": generatePivots(match),
+                    "Software Supply Chain": match.http ? extractSBOM(match.http) : "No Web Components",
                     "OT Details": {
                         "Product": match.product || "Unknown",
                         "Protocol": match.transport,
