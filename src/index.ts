@@ -46,6 +46,11 @@ interface SearchMatch {
   version?: string;
   hostnames: string[];
   domains: string[];
+  snmp?: {
+    sysDescr?: string;
+    sysContact?: string;
+    sysLocation?: string;
+  };
   rfb?: {
     authentication?: string; // "disabled" or "vnc"
     version?: string;
@@ -306,30 +311,37 @@ async function queryCPEDB(params: {
 function extractLeaks(data: string | undefined) {
     if (!data) return null;
 
-    // Regex for Private IPs (10.x, 192.168.x, 172.16-31.x)
+    // 1. Network Leaks (Existing)
     const privateIpRegex = /(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))(?:\.\d{1,3}){2}/g;
-    
-    // Regex for Windows Paths (e.g. C:\Project)
-    const winPathRegex = /[C-Z]:\\[\w\s\-\\]+/gi;
-    
-    // Regex for Emails
     const emailRegex = /[\w\.-]+@[\w\.-]+\.\w{2,}/g;
+    
+    // 2. Secret Leaks (New)
+    // Detect RSA/DSA Private Keys
+    const keyRegex = /-----BEGIN [A-Z]+ PRIVATE KEY-----/g;
+    // Detect Basic Auth strings or API tokens (Heuristic)
+    const tokenRegex = /(Authorization:\s*Basic\s+[a-zA-Z0-9+/=]+|AKIA[0-9A-Z]{16})/g;
+    // Detect Database Connection Strings
+    const dbRegex = /(postgres|mysql|mongodb):\/\/[a-zA-Z0-9_]+:[a-zA-Z0-9_]+@/g;
 
     const ips = data.match(privateIpRegex) || [];
-    const paths = data.match(winPathRegex) || [];
     const emails = data.match(emailRegex) || [];
+    const keys = data.match(keyRegex) || [];
+    const tokens = data.match(tokenRegex) || [];
+    const dbs = data.match(dbRegex) || [];
 
-    // Filter duplicates
+    // Deduplicate
     const uniqueIPs = [...new Set(ips)];
-    const uniquePaths = [...new Set(paths)];
     const uniqueEmails = [...new Set(emails)];
+    const uniqueSecrets = [...new Set([...keys, ...tokens, ...dbs])];
 
-    if (uniqueIPs.length === 0 && uniquePaths.length === 0 && uniqueEmails.length === 0) return null;
+    if (uniqueIPs.length === 0 && uniqueEmails.length === 0 && uniqueSecrets.length === 0) return null;
 
     return {
         "Internal IP Leaks": uniqueIPs.length > 0 ? uniqueIPs : "None",
-        "System Paths": uniquePaths.length > 0 ? uniquePaths : "None",
-        "Leaked Emails": uniqueEmails.length > 0 ? uniqueEmails : "None"
+        "Leaked Emails": uniqueEmails.length > 0 ? uniqueEmails : "None",
+        // CRITICAL FINDINGS
+        "Exposed Secrets": uniqueSecrets.length > 0 ? "🚨 CRITICAL: KEYS/TOKENS FOUND IN BANNER" : "None",
+        "Secret Snippets": uniqueSecrets // Shows the actual leaked string (Be careful with this in reports)
     };
 }
 
@@ -449,6 +461,52 @@ function parseDNP3Banner(banner: string | undefined) {
         "Source Address": sourceMatch ? sourceMatch[1] : "Unknown",
         "Destination Address": destMatch ? destMatch[1] : "Unknown",
         "Protocol Warning": "Cleartext SCADA Protocol (No Auth)"
+    };
+}
+
+function parseSNMPDetails(snmp: any) {
+    if (!snmp) return null;
+
+    return {
+        "System Description": snmp.sysDescr || "None",
+        "Location (Physical)": snmp.sysLocation || "Unknown",
+        "Contact Person": snmp.sysContact || "Unknown"
+    };
+}
+
+function predictOperationalRole(match: any) {
+    // Combine all text sources into one searchable string
+    const combinedData = JSON.stringify({
+        data: match.data,
+        org: match.org,
+        products: match.product,
+        webTitle: match.http?.title,
+        snmpLoc: match.snmp?.sysLocation
+    }).toLowerCase();
+
+    // 1. Sector Prediction
+    let sector = "Unknown / Generic";
+    if (combinedData.match(/(water|pump|tank|sewage|waste|flow|valve|pipe)/)) sector = "💧 WATER / WASTEWATER";
+    if (combinedData.match(/(volt|amp|grid|substation|solar|wind|energy|meter|power|hz)/)) sector = "⚡ ENERGY / POWER GRID";
+    if (combinedData.match(/(hvac|chiller|boiler|temp|air|building|floor|room|door|access)/)) sector = "🏢 BUILDING AUTOMATION";
+    if (combinedData.match(/(robot|arm|conveyor|factory|machine|production|line|plc)/)) sector = "🏭 MANUFACTURING";
+    if (combinedData.match(/(traffic|light|cam|road|intersection|transit)/)) sector = "🚦 TRANSPORTATION / CITY";
+
+    // 2. Physical Role Prediction
+    let role = "General Automation Device";
+    if (combinedData.includes("hmi") || combinedData.includes("scada") || combinedData.includes("visu")) role = "🖥️ Human-Machine Interface (HMI)";
+    if (combinedData.includes("cam") || combinedData.includes("dvr") || combinedData.includes("nvr")) role = "📷 Surveillance System";
+    if (combinedData.includes("printer") || combinedData.includes("copier")) role = "🖨️ Industrial Printer (High Leak Risk)";
+    if (combinedData.includes("master")) role = "👑 Master Controller / Head End";
+    if (combinedData.includes("sensor") || combinedData.includes("monitor")) role = "📡 Sensor / Monitor";
+
+    // Only return if we found something interesting
+    if (sector === "Unknown / Generic" && role === "General Automation Device") return null;
+
+    return {
+        "Predicted Sector": sector,
+        "Physical Function": role,
+        "Context Source": "Keyword Analysis of Banners"
     };
 }
 
@@ -611,6 +669,55 @@ function parseEtherNetIPBanner(banner: string | undefined) {
         "Product": productMatch[1].trim(), // e.g., "1769-L30ER"
         "Device Type": deviceTypeMatch ? deviceTypeMatch[1].trim() : "Unknown",
         "Serial Hex": serialMatch ? serialMatch[1] : "Unknown"
+    };
+}
+
+function analyzeHardwareProfile(product: string | undefined, banner: string | undefined) {
+    const text = ((product || "") + " " + (banner || "")).toLowerCase();
+    
+    // 1. "Muscle" - Kinetic Hazards (Motors, Drives, Servos)
+    // These devices physically move things. High danger.
+    if (text.match(/(powerflex|kinetix|altivar|sinamics|micromaster|variator|drive|servo|motion)/)) {
+        return {
+            "Class": "⚙️ MOTOR DRIVE / VFD (The 'Muscle')",
+            "Kinetic Risk": "🚨 HIGH - Can cause physical destruction (Over-speed/Torque)",
+            "Role": "Controls physical motion of pumps, fans, or robots."
+        };
+    }
+
+    // 2. "Nervous System" - Network Infrastructure
+    // These connect the plant. Disruption causes loss of view.
+    if (text.match(/(stratix|scalance|moxa nport|eds-|cisco ie|hirschmann|transceiver|gateway|router|switch)/)) {
+        return {
+            "Class": "🌐 INDUSTRIAL SWITCH / GATEWAY (The 'Nervous System')",
+            "Kinetic Risk": "Low - Primary risk is Denial of Service (Blindness)",
+            "Role": "Connects OT assets to the network."
+        };
+    }
+
+    // 3. "Face" - Human Machine Interfaces
+    // These allow operators to click buttons.
+    if (text.match(/(panelview|simatic hmi|comfort panel|magelis|pro-face|factorytalk|wincc|visu)/)) {
+        return {
+            "Class": "🖥️ HMI PANEL (The 'Face')",
+            "Kinetic Risk": "Medium - Depends on available buttons/screens",
+            "Role": "Operator visualization and manual control."
+        };
+    }
+
+    // 4. "Brain" - Controllers (Default if identifying as ICS)
+    if (text.match(/(plc|controller|logix|simatic|modicon|micro800|s7-|crio|rtu)/)) {
+        return {
+            "Class": "🧠 PLC / CONTROLLER (The 'Brain')",
+            "Kinetic Risk": "High - Controls logic and safety overrides",
+            "Role": "Executes the automation logic."
+        };
+    }
+
+    return {
+        "Class": "Unknown Industrial Device",
+        "Kinetic Risk": "Unknown",
+        "Role": "General Automation"
     };
 }
 
@@ -796,7 +903,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       name: "ot_asset_search",
       description: "Specialized search for Industrial Control Systems (OT). Maps high-level device types to specific, high-fidelity Shodan queries (ports, tags, and product names). Use this for finding PLCs, HMIs, or specific protocols.",
       inputSchema: zodToJsonSchema(z.object({
-        asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "general_ics"])
+        asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "snmp_infrastructure", "general_ics"])
           .describe("The specific class of OT device to hunt for."),
         country: z.string().length(2).optional().describe("2-letter country code (e.g., 'DE', 'US')."),
         org: z.string().optional().describe("Filter by specific organization name."),
@@ -978,7 +1085,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ot_asset_search": {
           // 1. Parse Arguments
           const parsedArgs = z.object({
-            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "dnp3_energy", "general_ics"]),
+            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "dnp3_energy", "snmp_infrastructure", "general_ics"]),
             country: z.string().length(2).optional(),
             org: z.string().optional(),
           }).safeParse(args);
@@ -999,6 +1106,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "mqtt_iiot": 'port:1883',
               "coap_smartgrid": 'port:5683',
               "vnc_hmi": 'port:5900',
+              "snmp_infrastructure": 'port:161',
               "general_ics": 'tag:ics'
           };
 
@@ -1056,8 +1164,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         "Exploit Resources": exploits || "No CVEs mapped"
                     },
                     "Infrastructure Type": classifyInfrastructure(match.isp, match.org),
+                    "HMI Screenshot": match.opts && match.opts.screenshot ? "📸 YES (View on Shodan Website)" : "No image captured",
                     "Pivot Points (Lateral Movement)": generatePivots(match),
                     "Software Supply Chain": match.http ? extractSBOM(match.http) : "No Web Components",
+                    "Operational Context": predictOperationalRole(match) || "Insufficient Data to Predict Role",
+                    "Hardware Profile": analyzeHardwareProfile(match.product, match.data),
                     "OT Details": {
                         "Product": match.product || "Unknown",
                         "Protocol": match.transport,
@@ -1073,7 +1184,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         ...(match.port === 1883 ? { "MQTT Broker (IIoT)": parseMQTTDetails(match.mqtt) } : {}),
                         ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
                         ...(match.port === 5900 ? { "VNC / HMI Panel": parseVNCDetails(match.rfb) } : {}),
-                        
+                        ...(match.port === 161 ? { "SNMP Details": parseSNMPDetails(match.snmp) } : {}),
+                      
                         // --- WEB FORENSICS ---
                         ...(match.http ? { "Web Interface Intel": analyzeWebStack(match.http) } : {}),
 
