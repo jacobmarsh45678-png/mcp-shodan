@@ -369,6 +369,62 @@ function parseS7Banner(banner: string | undefined) {
     };
 }
 
+function decodeHex(data: string | undefined) {
+    if (!data) return null;
+
+    // Look for common hex patterns: \x41 or 0x41 or just 414243
+    // We focus on \x escaped strings which are common in Shodan raw data
+    const hexEscapedRegex = /\\x([0-9A-Fa-f]{2})/g;
+    
+    // Check if we have enough hex to matter (at least 4 chars)
+    if ((data.match(hexEscapedRegex) || []).length < 4) return null;
+
+    try {
+        const decoded = data.replace(hexEscapedRegex, (match, grp) => {
+            return String.fromCharCode(parseInt(grp, 16));
+        });
+        
+        // Filter out non-printable characters to keep it clean
+        const cleanDecoded = decoded.replace(/[^\x20-\x7E]/g, '');
+        
+        return cleanDecoded.length > 3 ? cleanDecoded : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function analyzeCookies(http: any) {
+    if (!http || !http.headers) return null;
+    
+    // Shodan usually puts raw headers in a string or object. 
+    // Note: The standard Shodan 'http' object implies parsed fields, 
+    // checking specific 'Set-Cookie' might require raw data parsing 
+    // or specific Shodan header fields if available.
+    // For this implementation, we will look for cookie patterns in the main data banner
+    // because Shodan's API 'http' object doesn't always strictly break out Set-Cookie.
+    
+    return null; // Placeholder if we rely only on structured http object
+}
+
+// We interpret the raw banner for Cookies instead
+function extractSessionRisks(data: string | undefined) {
+    if (!data) return null;
+
+    const cookieRegex = /Set-Cookie:\s*([^;\r\n]+)/gi;
+    const cookies = data.match(cookieRegex);
+
+    if (!cookies) return null;
+
+    const riskyCookies = cookies.filter(c => 
+        !c.toLowerCase().includes("secure") || 
+        !c.toLowerCase().includes("httponly")
+    );
+
+    return riskyCookies.length > 0 
+        ? { "Insecure Cookies": riskyCookies.map(c => c.trim()) } 
+        : "Cookies present but flagged Secure/HttpOnly";
+}
+
 function identifyDefaultCreds(product: string | undefined, org: string | undefined) {
     if (!product && !org) return null;
     const targets = [];
@@ -740,6 +796,74 @@ function parseMQTTDetails(mqtt: any) {
         "Complexity Score": pathDepth > 3 ? "HIGH (Deep Hierarchy Leaked)" : "Low",
         "Raw Topics": topics.length > 5 ? `${topics.length - 5} more...` : "All listed"
     };
+}
+
+function analyzeGatewayTopology(match: any) {
+    const data = match.data || "";
+    let topologyType = "Single Endpoint Device";
+    let details = "Direct connection to one asset.";
+
+    // 1. Modbus Multi-Unit Detection
+    // Shodan often lists "Unit ID: X" multiple times if a gateway is present
+    const unitIds = (data.match(/Unit ID:\s*(\d+)/g) || []).length;
+    if (unitIds > 1) {
+        topologyType = "🌐 MODBUS GATEWAY / CONCENTRATOR";
+        details = `⚠️ Bridging ${unitIds} distinct devices/slaves behind one IP.`;
+    }
+
+    // 2. DNP3 Master/Outstation Logic
+    if (match.port === 20000 || data.includes("DNP3")) {
+        const src = data.match(/Source:\s*(\d+)/)?.[1];
+        const dst = data.match(/Destination:\s*(\d+)/)?.[1];
+        if (src && dst) {
+            // High addresses often imply large networks
+            if (parseInt(src) > 100 || parseInt(dst) > 100) {
+                topologyType = "⚡ DNP3 NETWORK NODE";
+                details = `Routing traffic between Address ${src} and ${dst}.`;
+            }
+        }
+    }
+
+    // 3. 7-Mode / Encapsulation
+    if (data.includes("Encapsulation Header")) {
+        topologyType = "bridge/Tunnel Entry Point";
+        details = "Encapsulating Serial protocols over Ethernet.";
+    }
+
+    return {
+        "Topology": topologyType,
+        "Network Depth": details
+    };
+}
+
+function detectProtocolAnomalies(match: any) {
+    const port = match.port;
+    const banner = (match.data || "").toLowerCase();
+    const product = (match.product || "").toLowerCase();
+    
+    const warnings = [];
+
+    // 1. The "SSH on OT Port" Honeypot Check
+    if ((port === 102 || port === 502 || port === 44818) && banner.includes("ssh")) {
+        warnings.push("🚨 HIGH CONFIDENCE HONEYPOT: SSH running on critical ICS port.");
+    }
+
+    // 2. The "Web on PLC Port" (Siemens specific feature)
+    if (port === 102 && banner.includes("http")) {
+        warnings.push("⚠️ Siemens S7 Web Server enabled on Control Port (Risk of hijacking).");
+    }
+
+    // 3. The "Plaintext Credentials" Leak
+    if (banner.includes("auth: disabled") || banner.includes("login: anonymous")) {
+        warnings.push("🔥 CRITICAL: Protocol explicitly reports Authentication is DISABLED.");
+    }
+
+    // 4. Mismatched Transport (e.g. Modbus over UDP is rare/custom)
+    if (port === 502 && match.transport === "udp") {
+        warnings.push("❓ ANOMALY: Modbus over UDP (Standard is TCP). Custom implementation?");
+    }
+
+    return warnings.length > 0 ? warnings : "Standard Protocol Configuration";
 }
 
 function parseCoAPDetails(coap: any) {
@@ -1189,6 +1313,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
                         ...(match.port === 5900 ? { "VNC / HMI Panel": parseVNCDetails(match.rfb) } : {}),
                         ...(match.port === 161 ? { "SNMP Details": parseSNMPDetails(match.snmp) } : {}),
+
+                        // --- NEW: TOPOLOGY & ANOMALIES ---
+                        "Internal Topology": analyzeGatewayTopology(match),
+                        "Protocol Hygiene": detectProtocolAnomalies(match),
+                      
+                        // --- CRYPTANALYSIS ---
+                        ...(decodeHex(match.data) ? { "Decoded Hex Dump": decodeHex(match.data) } : {}),
+                        ...(extractSessionRisks(match.data) ? { "Session Hygiene": extractSessionRisks(match.data) } : {}),
                       
                         // --- WEB FORENSICS ---
                         ...(match.http ? { "Web Interface Intel": analyzeWebStack(match.http) } : {}),
