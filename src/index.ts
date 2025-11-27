@@ -36,6 +36,11 @@ interface SearchLocation {
 interface SearchMatch {
   product?: string;
   hash: number;
+  tags?: string[]; // <--- ADD THIS
+  opts?: {         // <--- ADD THIS BLOCK
+    screenshot?: boolean;
+    [key: string]: any;
+  };
   ip: number;
   ip_str: string;
   org: string;
@@ -1142,8 +1147,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     "Location": {
                         "City": `${match.location.city}, ${match.location.country_name}`,
                         "Coordinates": `${match.location.latitude}, ${match.location.longitude}`,
-                        "Map View": `https://www.google.com/maps?q=$${match.location.latitude},${match.location.longitude}`
-                    },
+                        "Map View": `https://www.google.com/maps?q=${match.location.latitude},${match.location.longitude}`                    },
                     "Risk Analysis": {
                         "Honeypot Level": calculateHoneypotRisk(match),
                         "Critical Threats": match.tags && match.tags.includes("kev") 
@@ -1212,49 +1216,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
       }
         
-                "Vulnerability Context": {
-                    "Direct Match": match.vulns || [],
-                    // Intelligence: If we have a product and version, suggest the exact CPE lookup
-                    "CPE Suggestion": match.cpe && match.cpe.length > 0 
-                        ? `Use cves_by_product with cpe23: '${match.cpe[0]}'` 
-                        : (match.product 
-                            ? `Use cves_by_product with product: '${match.product}'` 
-                            : "Insufficient data for correlation")
-                },
-                "OT Details": {
-                    "Product": match.product || "Unknown",
-                    "Protocol": match.transport,
-                    
-                    // EXISTING: Protocol Parsers
-                    // Siemens (Port 102)
-                    ...(match.port === 102 ? { "Siemens Internals": parseS7Banner(match.data) } : {}),
-                    // Rockwell (Port 44818)
-                    ...(match.port === 44818 ? { "Rockwell Internals": parseEtherNetIPBanner(match.data) } : {}),
-                    // Modbus (Port 502)
-                    ...(match.port === 502 ? { "Modbus Internals": parseModbusBanner(match.data) } : {}),
-                    // BACnet (Port 47808) - Note: we use match.bacnet object here, not match.data
-                    ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
-                    // DNP3
-                    ...(match.port === 20000 ? { "DNP3 Details": parseDNP3Banner(match.data) } : {}),
-                  
-                    // NEW: Certificate Intelligence
-                    ...(match.ssl ? { "Digital Identity (SSL)": analyzeCertificate(match.ssl) } : {}),
-
-                    "Raw Banner Snippet": match.data ? match.data.substring(0, 50) + "..." : "Empty"
-                }
-            }))
-          };
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(formattedResult, null, 2),
-              },
-            ],
-          };
-      } 
-
       case "cve_lookup": {
         const parsedCveArgs = CVELookupArgsSchema.safeParse(args);
         if (!parsedCveArgs.success) {
