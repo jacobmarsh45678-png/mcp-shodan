@@ -63,6 +63,7 @@ interface SearchMatch {
   location: SearchLocation;
   timestamp: string;
   port: number;
+  ports?: number[];
   mqtt?: {
     topics?: Record<string, string>; // Shodan returns topic: payload pairs
   };
@@ -1418,6 +1419,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             : (guessedCPE 
                                 ? `⚠️ Shodan missed the CPE. My heuristic suggests: '${guessedCPE}'`
                                 : "No CPE match found"),
+                        "Documentation Link": manualLink, // The Librarian
                         "Exploit Resources": exploits || "No CVEs mapped"
                     },
                     "Infrastructure Type": classifyInfrastructure(match.isp, match.org),
@@ -1427,7 +1429,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     "Operational Context": predictOperationalRole(match) || "Insufficient Data to Predict Role",
                     "Hardware Profile": analyzeHardwareProfile(match.product, match.data),
                     "Internal Topology": analyzeGatewayTopology(match), 
-                    "Device Role": detectGatewayRole(result.matches[0].ports || [match.port]), 
+                    "Device Role": detectGatewayRole(match.ports || [match.port]), 
                     "OT Details": {
                         "Product": match.product || "Unknown",
                         "Protocol": match.transport,
