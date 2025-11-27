@@ -277,6 +277,46 @@ async function queryShodan(endpoint: string, params: Record<string, any>) {
   }
 }
 
+function parseGESRTPBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // GE SRTP banners often leak the exact CPU info
+    // Look for "GE Fanuc", "Emerson", or specific CPU models like "CPE305"
+    const vendorMatch = banner.match(/(GE Fanuc|Emerson|General Electric)/);
+    const cpuMatch = banner.match(/CPU\s*([A-Z0-9]+)/); // e.g., CPU331
+    const firmwareMatch = banner.match(/Firmware:\s*([\d\.]+)/);
+
+    if (!vendorMatch && !cpuMatch) return null;
+
+    return {
+        "Vendor": vendorMatch ? vendorMatch[0] : "GE / Emerson",
+        "CPU Model": cpuMatch ? cpuMatch[1] : "Unknown Series 90/Rx3i",
+        "Firmware": firmwareMatch ? firmwareMatch[1] : "Unknown",
+        "Protocol": "GE SRTP (Turbine/Grid Control)"
+    };
+}
+
+function parseFoxBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // Tridium Niagara / Fox Protocol
+    // Extracts: "niagara.brand": "Vykon", "niagara.version": "4.10.1.36"
+    const brandMatch = banner.match(/niagara\.brand=\s*([^\r\n,]+)/);
+    const versionMatch = banner.match(/niagara\.version=\s*([^\r\n,]+)/);
+    const stationMatch = banner.match(/station\.name=\s*([^\r\n,]+)/);
+    const hostIdMatch = banner.match(/hostId=\s*([^\r\n,]+)/);
+
+    if (!versionMatch) return null;
+
+    return {
+        "Framework": "Tridium Niagara (Fox Protocol)",
+        "Station Name": stationMatch ? stationMatch[1].replace(/"/g, "") : "Unknown",
+        "Brand ID": brandMatch ? brandMatch[1].replace(/"/g, "") : "Generic",
+        "Niagara Version": versionMatch ? versionMatch[1].replace(/"/g, "") : "Unknown",
+        "Host ID": hostIdMatch ? hostIdMatch[1].replace(/"/g, "") : "Unknown"
+    };
+}
+
 // Helper Function for CVE lookups using CVEDB
 async function queryCVEDB(cveId: string) {
   try {
@@ -741,6 +781,24 @@ function parseEtherNetIPBanner(banner: string | undefined) {
         "Firmware Revision": revMatch ? revMatch[1] : "Unknown"
     };
 }
+
+function parseProfinetBanner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // Profinet DCP (Discovery) response
+    // Leaks: "NameOfStation", "VendorID", "DeviceID"
+    const stationMatch = banner.match(/NameOfStation:\s*([^\r\n]+)/);
+    const typeMatch = banner.match(/DeviceType:\s*([^\r\n]+)/);
+    const roleMatch = banner.match(/Role:\s*(\d+)/); // 1=IO-Controller, 2=IO-Device
+
+    if (!stationMatch && !typeMatch) return null;
+
+    return {
+        "Protocol": "Profinet (Industrial Ethernet)",
+        "Station Name": stationMatch ? stationMatch[1] : "Unknown",
+        "Device Type": typeMatch ? typeMatch[1] : "Unknown",
+        "Role": roleMatch && roleMatch[1] === '1' ? "IO-Controller (Master)" : "IO-Device (Slave)"
+    };
 }
 
 function parseBACnetDetails(bacnet: any) {
@@ -1098,7 +1156,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       name: "ot_asset_search",
       description: "Specialized search for Industrial Control Systems (OT). Maps high-level device types to specific, high-fidelity Shodan queries (ports, tags, and product names). Use this for finding PLCs, HMIs, or specific protocols.",
       inputSchema: zodToJsonSchema(z.object({
-        asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "snmp_infrastructure", "general_ics"])
+        asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "snmp_infrastructure", "ge_srtp", "tridium_fox", "profinet_device", "general_ics"])
           .describe("The specific class of OT device to hunt for."),
         country: z.string().length(2).optional().describe("2-letter country code (e.g., 'DE', 'US')."),
         org: z.string().optional().describe("Filter by specific organization name."),
@@ -1280,7 +1338,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ot_asset_search": {
           // 1. Parse Arguments
           const parsedArgs = z.object({
-            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "dnp3_energy", "snmp_infrastructure", "general_ics"]),
+            asset_type: z.enum(["siemens_s7", "modbus_generic", "niagara_building", "bacnet_building", "ethernet_ip", "omron_plc", "mqtt_iiot", "coap_smartgrid", "vnc_hmi", "dnp3_energy", "snmp_infrastructure", "ge_srtp", "tridium_fox", "profinet_device", "general_ics"]),
             country: z.string().length(2).optional(),
             org: z.string().optional(),
           }).safeParse(args);
@@ -1303,7 +1361,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "vnc_hmi": 'port:5900',
               "snmp_infrastructure": 'port:161',
               "omron_plc": 'port:9600 response:"OMRON"', 
-              "redlion_gateway": 'port:789', 
+              "redlion_gateway": 'port:789',
+              "ge_srtp": 'port:18245',
+              "tridium_fox": 'port:1911,4911',
+              "profinet_device": 'port:34964',
               "general_ics": 'tag:ics'
           };
 
@@ -1379,7 +1440,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         ...(match.port === 47808 ? { "BACnet Details": parseBACnetDetails(match.bacnet) } : {}),
                         ...(match.port === 9600 ? { "Omron Internals": parseOmronBanner(match.data) } : {}),
                         ...(match.port === 789 ? { "Red Lion Details": parseRedLionBanner(match.data) } : {}),
-                        
+                        ...(match.port === 18245 ? { "GE SRTP Details": parseGESRTPBanner(match.data) } : {}),
+                        ...(match.port === 1911 || match.port === 4911 ? { "Tridium Fox Details": parseFoxBanner(match.data) } : {}),
+                        ...(match.port === 34964 ? { "Profinet Station Info": parseProfinetBanner(match.data) } : {}),
+                      
                         // --- HMI / IoT PARSERS ---
                         ...(match.port === 1883 ? { "MQTT Broker (IIoT)": parseMQTTDetails(match.mqtt) } : {}),
                         ...(match.port === 5683 ? { "CoAP Device": parseCoAPDetails(match.coap) } : {}),
