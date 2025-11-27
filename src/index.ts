@@ -296,6 +296,28 @@ function parseS7Banner(banner: string | undefined) {
     };
 }
 
+// Add this to your helper functions
+function parseDNP3Banner(banner: string | undefined) {
+    if (!banner) return null;
+
+    // DNP3 often returns source/destination addresses in the raw hex or banner text
+    // Shodan DNP3 banners usually look like "DNP3 Application Layer: ..."
+    const sourceMatch = banner.match(/Source:\s*(\d+)/);
+    const destMatch = banner.match(/Destination:\s*(\d+)/);
+    
+    // Check for "Controller" or "Outstation" strings common in DNP3 responses
+    const typeMatch = banner.match(/(Outstation|Master|Controller)/i);
+
+    if (!sourceMatch && !typeMatch) return null;
+
+    return {
+        "Role": typeMatch ? typeMatch[0] : "Unknown (Likely Outstation)",
+        "Source Address": sourceMatch ? sourceMatch[1] : "Unknown",
+        "Destination Address": destMatch ? destMatch[1] : "Unknown",
+        "Protocol Warning": "Cleartext SCADA Protocol (No Auth)"
+    };
+}
+
 function parseModbusBanner(banner: string | undefined) {
     if (!banner) return null;
 
@@ -369,27 +391,37 @@ function parseEtherNetIPBanner(banner: string | undefined) {
 
 function calculateHoneypotRisk(host: any): string {
     let riskScore = 0;
-    const cloudProviders = ["Amazon", "DigitalOcean", "Google", "Microsoft", "Alibaba", "Tencent"];
-   
-    // CHECK 1: Is the "PLC" hosted in a cloud data center? (Real PLCs are usually on ISPs/Mobile/Biz lines)
+    const cloudProviders = ["Amazon", "DigitalOcean", "Google", "Microsoft", "Alibaba", "Tencent", "Oracle"];
+    
+    // Known Honeypot Artifacts (e.g., Default Conpot S7 Serial Number)
+    const knownHoneypotSerials = ["88111222", "00000000"]; 
+    
+    // CHECK 1: Cloud Hosting
     if (cloudProviders.some(provider => host.org?.includes(provider) || host.isp?.includes(provider))) {
         riskScore += 50;
     }
 
-    // CHECK 2: Does it have too many ports open? (Real PLCs usually have 1-3 ports, e.g., 80 + 102)
+    // CHECK 2: Port Noise
     if (host.ports && host.ports.length > 5) {
         riskScore += 30;
     }
 
-    // CHECK 3: Tag check
+    // CHECK 3: Artifact Detection (Deep Inspection)
+    const bannerStr = JSON.stringify(host.data);
+    if (knownHoneypotSerials.some(serial => bannerStr.includes(serial))) {
+        riskScore += 100; // Immediate flag
+    }
+
+    // CHECK 4: Tag check
     if (host.tags && host.tags.includes("honeypot")) {
         riskScore += 100;
     }
 
+    if (riskScore >= 100) return "CRITICAL (Confirmed Honeypot Artifact)";
     if (riskScore >= 50) return "HIGH (Likely Honeypot)";
     if (riskScore >= 30) return "MEDIUM (Suspicious)";
     return "LOW (Likely Real Asset)";
-    }
+}
 
 function assessThreatLevel(cve: any) {
     const epssScore = cve.epss || 0;
@@ -706,6 +738,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "modbus_generic": 'port:502',
               "niagara_building": 'port:1911,4911 product:"Niagara"',
               "bacnet_building": 'port:47808',
+              // Inside the switch/map in ot_asset_search
+              "dnp3_energy": 'port:20000 source address',
               "ethernet_ip": 'port:44818',
               "omron_plc": 'port:9600 response:"OMRON"',
               "general_ics": 'tag:ics'
@@ -743,6 +777,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         ? "⚠️ CONTAINS KNOWN EXPLOITED VULNERABILITIES" 
                         : "No active exploitation tags",
                     "Open Ports": match.port
+                },
+                "Vulnerability Context": {
+                    "Direct Match": match.vulns || [],
+                    // Intelligence: If we have a product and version, suggest the exact CPE lookup
+                    "CPE Suggestion": match.cpe && match.cpe.length > 0 
+                        ? `Use cves_by_product with cpe23: '${match.cpe[0]}'` 
+                        : (match.product 
+                            ? `Use cves_by_product with product: '${match.product}'` 
+                            : "Insufficient data for correlation")
                 },
                 "OT Details": {
                     "Product": match.product || "Unknown",
